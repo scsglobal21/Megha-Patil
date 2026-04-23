@@ -1,0 +1,323 @@
+# PCMC Complaint WhatsApp Automation 🏛️
+
+Automated WhatsApp notification system for Pimpri-Chinchwad Municipal Corporation (PCMC) citizen complaint management.
+
+## Features
+- 📝 Google Form → Auto complaint registration
+- 📊 Google Sheets → Complaint tracking
+- 💬 WhatsApp Auto notifications on status change
+- 🔒 Sheet protection for data security
+- 📋 History log for all actions
+
+## Flow
+Citizen submits form → Complaint ID generated → WhatsApp msg sent → Status update → Auto notification
+
+## Tech Stack
+- Google Apps Script
+- Google Forms & Sheets
+- WappConnect WhatsApp API
+- Meta WhatsApp Business API
+
+'''
+var WA_API_URL = 'https://crmapi.wappconnect.com/api/meta/v19.0/890784247460075/messages';
+var WA_TOKEN   = 'qx1IgaYRumfSMgKkJ67hmQURxuvh8qQgwCd6sKHURMVU5ERVJTQ09SRQhHsbmuu7zKICIewYoGDynuBJ0clAMCVU5ERVJTQ09SRQzKRPF1fC78ZXREFTSAkFpiLGKDVREFTSAyKEj15qaeosNX9blzyMcIhN93PrsbIlF6Yt11oPKJzBUSYHwLzvOIft3VllhdZw3iNAfREFTSA1fkRMKRwlMh9F0vdQZv3GOCoRXs1BJd9TrXKFCPDqvBcBGY7SVU5ERVJTQ09SRQArdTFuZNZKHijg';
+
+var TEMPLATES = {
+  'New': {
+    name: 'new',
+    parameters: function(name, id, department, assignedTo) {
+      return [
+        { type: 'text', text: name || 'N/A' },
+        { type: 'text', text: id || 'N/A' },
+        { type: 'text', text: department || 'N/A' }
+      ];
+    }
+  },
+  'Assigned': {
+    name: 'assigned',
+    parameters: function(name, id, department, assignedTo) {
+      return [
+        { type: 'text', text: name || 'N/A' },
+        { type: 'text', text: assignedTo || 'PCMC अधिकारी' },
+        { type: 'text', text: department || 'N/A' }
+      ];
+    }
+  },
+  'In Progress': {
+    name: 'inprogress',
+    parameters: function(name, id, department, assignedTo) {
+      return [{ type: 'text', text: name || 'N/A' }];
+    }
+  },
+  'Completed': {
+    name: 'completed',
+    parameters: function(name, id, department, assignedTo) {
+      return [{ type: 'text', text: name || 'N/A' }];
+    }
+  }
+};
+
+// ── Mobile format — 91 एकदाच ─────────────────────────────────────────────
+function formatMobile(raw) {
+  var num = String(raw).replace(/\D/g, '');
+  return num.startsWith('91') ? num : '91' + num;
+}
+
+// ── WhatsApp msg पाठवणे ───────────────────────────────────────────────────
+function sendWhatsApp(mobile, templateName, parameters) {
+  var waPayload = {
+    to: mobile,
+    recipient_type: 'individual',
+    type: 'template',
+    template: {
+      language: { policy: 'deterministic', code: 'en' },
+      name: templateName,
+      components: [{
+        type: 'body',
+        parameters: parameters
+      }]
+    }
+  };
+
+  Logger.log('Sending to: ' + mobile + ' | Template: ' + templateName);
+  Logger.log('Parameters: ' + JSON.stringify(parameters));
+
+  var waResponse = UrlFetchApp.fetch(WA_API_URL, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'Authorization': 'Bearer ' + WA_TOKEN },
+    payload: JSON.stringify(waPayload),
+    muteHttpExceptions: true
+  });
+
+  var responseText = waResponse.getContentText();
+  Logger.log('Response Code: ' + waResponse.getResponseCode());
+  Logger.log('Response: ' + responseText);
+
+  var waResult  = JSON.parse(responseText);
+  var timestamp = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'dd-MM-yyyy HH:mm:ss');
+
+  if (waResult.message && waResult.message.message_status === 'queued') {
+    return '✅ Sent | ' + timestamp;
+  } else if (waResult.messages && waResult.messages.length > 0) {
+    return '✅ Sent | ' + timestamp;
+  } else if (waResult.error) {
+    return '❌ Failed | ' + waResult.error.message;
+  } else {
+    return '⚠️ ' + responseText;
+  }
+}
+
+// ── Sheet Protect — एकदाच run करा ────────────────────────────────────────
+function protectSheet() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('तक्रारी | Complaints');
+
+  // आधीचे protections काढा
+  var ranges = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+  ranges.forEach(function(p) { p.remove(); });
+  var sheets = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+  sheets.forEach(function(p) { p.remove(); });
+
+  // पूर्ण sheet lock करा
+  var protection = sheet.protect().setDescription('PCMC Sheet Protected');
+  protection.setWarningOnly(false);
+
+  // फक्त Status (L) आणि Assigned To (N) unlock करा
+  protection.setUnprotectedRanges([
+    sheet.getRange('L2:L1000'),  // Status ✅
+    sheet.getRange('N2:N1000')   // Assigned To ✅
+  ]);
+
+  // फक्त owner edit करू शकतो
+  var me = Session.getEffectiveUser();
+  protection.addEditor(me);
+  protection.removeEditors(protection.getEditors());
+  if (protection.canDomainEdit()) {
+    protection.setDomainEdit(false);
+  }
+
+  Logger.log('✅ Sheet protected!');
+  SpreadsheetApp.getUi().alert('✅ Sheet lock झाली!\n\nफक्त Status (Col L) आणि Assigned To (Col N) edit होईल.');
+}
+
+// ── Form Submit — नवीन तक्रार ─────────────────────────────────────────────
+function onFormSubmit(e) {
+  var ss           = SpreadsheetApp.getActiveSpreadsheet();
+  var formSheet    = ss.getSheetByName('Form responses 1');
+  var compSheet    = ss.getSheetByName('तक्रारी | Complaints');
+  var historySheet = ss.getSheetByName('History');
+
+  if (!formSheet || !compSheet) { Logger.log('❌ Sheet नाही'); return; }
+
+  Utilities.sleep(2000);
+
+  var lastFormRow = formSheet.getLastRow();
+  var rowData     = formSheet.getRange(lastFormRow, 1, 1, 12).getValues()[0];
+
+  var name      = String(rowData[1]).trim();       // B - नाव
+  var mobile    = formatMobile(rowData[2]);         // C - Mobile
+  var email     = String(rowData[3]).trim();        // D - Email
+  var dept1     = String(rowData[4]).trim();        // E - विभाग dropdown
+  var dept2     = String(rowData[5]).trim();        // F - विभाग text
+  var ward      = String(rowData[6]).trim();        // G - वॉर्ड
+  var desc      = String(rowData[7]).trim();        // H - तक्रार विवरण
+  var rawDate   = rowData[8];                       // I - तक्रार दिनांक
+  var location  = String(rowData[9]).trim();        // J - Location
+  var photo     = String(rowData[10]).trim();       // K - छायाचित्र
+  var firstComp = String(rowData[11]).trim();       // L - First Complaint
+
+  var department = dept1 !== '' ? dept1 : dept2;
+
+  // Date format
+  var incDate = '';
+  if (rawDate instanceof Date) {
+    incDate = Utilities.formatDate(rawDate, 'Asia/Kolkata', 'dd-MM-yyyy');
+  } else {
+    incDate = String(rawDate).trim();
+  }
+
+  // Validation
+  if (!name || name === '') { Logger.log('❌ Name नाही'); return; }
+  if (mobile.length < 12)  { Logger.log('❌ Mobile नाही'); return; }
+
+  var sendTime    = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'dd-MM-yyyy HH:mm:ss');
+  var complaintId = 'PCMC-' + new Date().getFullYear() + '-' +
+                    String(compSheet.getLastRow()).padStart(4, '0');
+
+  // Complaint sheet — 14 columns
+  compSheet.appendRow([
+    complaintId,  // A(0)  - Complaint ID
+    name,         // B(1)  - नाव ✅
+    mobile,       // C(2)  - Mobile ✅
+    email,        // D(3)  - Email ✅
+    department,   // E(4)  - Department ✅
+    ward,         // F(5)  - Ward ✅
+    desc,         // G(6)  - Description ✅
+    incDate,      // H(7)  - Date ✅
+    location,     // I(8)  - Location ✅
+    photo,        // J(9)  - Photo ✅
+    firstComp,    // K(10) - First Complaint ✅
+    'New',        // L(11) - Status
+    '',           // M(12) - Messages
+    ''            // N(13) - Assigned To
+  ]);
+
+  var newCompRow   = compSheet.getLastRow();
+  var parameters   = TEMPLATES['New'].parameters(name, complaintId, department, '');
+  var waStatusText = sendWhatsApp(mobile, 'new', parameters);
+
+  // Form responses — Messages col (13)
+  formSheet.getRange(lastFormRow, 13).setValue(waStatusText);
+  formSheet.getRange(lastFormRow, 13).setBackground(
+    waStatusText.indexOf('✅') !== -1 ? '#D6F0DC' : '#F8D7DA'
+  );
+
+  // Complaint sheet — Messages col M (13)
+  compSheet.getRange(newCompRow, 13).setValue(waStatusText);
+  compSheet.getRange(newCompRow, 13).setBackground(
+    waStatusText.indexOf('✅') !== -1 ? '#D6F0DC' : '#F8D7DA'
+  );
+
+  // History log
+  if (historySheet) {
+    historySheet.appendRow([
+      sendTime, name, mobile,
+      department, ward,
+      '—', 'New', 'new', waStatusText
+    ]);
+    historySheet.getRange(historySheet.getLastRow(), 9).setBackground(
+      waStatusText.indexOf('✅') !== -1 ? '#D6F0DC' : '#F8D7DA'
+    );
+  }
+
+  Logger.log('✅ Form | ' + complaintId + ' | ' + name + ' | ' + mobile + ' | ' + waStatusText);
+}
+
+// ── Status Change — Complaint sheet edit ─────────────────────────────────
+function onEditTrigger(e) {
+  var sheet = e.range.getSheet();
+  if (sheet.getName() !== "तक्रारी | Complaints") return;
+
+  var col = e.range.getColumn();
+  var row = e.range.getRow();
+  if (row <= 1) return;
+  if (col !== 12) return; // L = Status col 12
+
+  var newStatus = String(e.range.getValue()).trim();
+  if (!newStatus || !TEMPLATES[newStatus]) {
+    Logger.log('❌ Template नाही: ' + newStatus);
+    return;
+  }
+
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(3000)) { Logger.log('❌ Lock नाही'); return; }
+
+  try {
+    Utilities.sleep(1000);
+
+    var rowData    = sheet.getRange(row, 1, 1, 14).getValues()[0];
+    var id         = String(rowData[0]).trim();   // A(0)  - Complaint ID
+    var name       = String(rowData[1]).trim();   // B(1)  - नाव
+    var mobile     = formatMobile(rowData[2]);    // C(2)  - Mobile
+    var department = String(rowData[4]).trim();   // E(4)  - Department
+    var assignedTo = String(rowData[13]).trim();  // N(13) - Assigned To ✅
+    var oldStatus  = e.oldValue || '—';
+    var timestamp  = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'dd-MM-yyyy HH:mm:ss');
+
+    Logger.log('Name: ' + name + ' | Mobile: ' + mobile);
+    Logger.log('Department: ' + department + ' | AssignedTo: ' + assignedTo);
+    Logger.log('Status: ' + oldStatus + ' → ' + newStatus);
+
+    if (!name || name === '') { Logger.log('❌ Name नाही'); return; }
+    if (mobile.length < 12)  { Logger.log('❌ Mobile नाही'); return; }
+    if (newStatus === String(oldStatus).trim()) { Logger.log('❌ Same status'); return; }
+
+    // Duplicate check
+    var cache    = CacheService.getScriptCache();
+    var cacheKey = 'row_' + row + '_' + newStatus;
+    if (cache.get(cacheKey)) { Logger.log('❌ Duplicate'); return; }
+    cache.put(cacheKey, 'sent', 15);
+
+    var template     = TEMPLATES[newStatus];
+    var parameters   = template.parameters(name, id, department, assignedTo);
+    var waStatusText = sendWhatsApp(mobile, template.name, parameters);
+
+    // Messages col M (13)
+    sheet.getRange(row, 13).setValue(waStatusText);
+    sheet.getRange(row, 13).setBackground(
+      waStatusText.indexOf('✅') !== -1 ? '#D6F0DC' : '#F8D7DA'
+    );
+
+    // History log
+    var historySheet = e.source.getSheetByName('History');
+    if (historySheet) {
+      historySheet.appendRow([
+        timestamp, name, mobile,
+        department, assignedTo,
+        oldStatus, newStatus,
+        template.name, waStatusText
+      ]);
+      historySheet.getRange(historySheet.getLastRow(), 9).setBackground(
+        waStatusText.indexOf('✅') !== -1 ? '#D6F0DC' : '#F8D7DA'
+      );
+    }
+
+    Logger.log('✅ ' + template.name + ' | ' + id + ' | ' + name + ' | ' + oldStatus + ' → ' + newStatus);
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ── Debug — column positions check ───────────────────────────────────────
+function debugRow() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet()
+                            .getSheetByName('तक्रारी | Complaints');
+  var row     = 8;
+  var rowData = sheet.getRange(row, 1, 1, 20).getValues()[0];
+  for (var i = 0; i < rowData.length; i++) {
+    Logger.log('Col ' + (i+1) + ' (index ' + i + '): ' + rowData[i]);
+  }
+}
+'''
